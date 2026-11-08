@@ -21,6 +21,20 @@ type Flags struct {
 
 	mu sync.Mutex
 	db *DB
+	// SQL to clean up by hand, logged when we exit without cleaning up
+	cleanupSQL string
+}
+
+func (f *Flags) SetCleanupSQL(sql string) {
+	f.mu.Lock()
+	f.cleanupSQL = sql
+	f.mu.Unlock()
+}
+
+func (f *Flags) CleanupSQL() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleanupSQL
 }
 
 func (f *Flags) Terminating() (int, bool) {

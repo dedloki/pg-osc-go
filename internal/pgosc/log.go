@@ -13,7 +13,7 @@ import (
 )
 
 // Version is set at build time (-ldflags "-X .../pgosc.Version=...").
-var Version = "0.11.1"
+var Version = "0.11.2"
 
 const (
 	LevelTrace = 10

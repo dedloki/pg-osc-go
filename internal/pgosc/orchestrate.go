@@ -82,6 +82,7 @@ func Run(opts *Options, flags *Flags) error {
 		c.db.Close()
 	}()
 
+	flags.SetCleanupSQL(c.manualCleanupSQL())
 	err = c.runSteps()
 	if err == nil {
 		Info("All tasks successfully completed")
@@ -94,7 +95,8 @@ func Run(opts *Options, flags *Flags) error {
 		Fatal("Something went wrong: "+err.Error(), "e", fmt.Sprintf("%+v", err))
 	}
 	if cerr := c.dropAndCleanup(false); cerr != nil {
-		Error("Cleanup failed: " + cerr.Error())
+		Error("Cleanup failed: "+cerr.Error()+". Clean up by hand (drop the trigger first, it needs the lock; until then writes go to the audit table)",
+			"cleanup_sql", c.manualCleanupSQL())
 	}
 	return err
 }
@@ -179,7 +181,8 @@ func (c *Ctx) setupTrigger() error {
 		if c.auditTablePKSequence == nil {
 			return errors.New("audit table sequence not found")
 		}
-		seq, audit, table := *c.auditTablePKSequence, c.auditTable, c.opts.TableName
+		// schema-qualified: the trigger runs with the search_path of whoever writes to the table
+		seq, audit, table := *c.auditTablePKSequence, QuoteIdent(c.opts.Schema)+"."+QuoteIdent(c.auditTable), c.opts.TableName
 		sql := fmt.Sprintf(`DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %[3]s;
 
 CREATE OR REPLACE FUNCTION primary_to_audit_table_trigger()
@@ -187,13 +190,13 @@ RETURNS TRIGGER AS
 $$
 BEGIN
   IF ( TG_OP = 'INSERT') THEN
-    INSERT INTO "%[2]s" select nextval('%[1]s'), 'INSERT', clock_timestamp(), NEW.* ;
+    INSERT INTO %[2]s select nextval('%[1]s'), 'INSERT', clock_timestamp(), NEW.* ;
     RETURN NEW;
   ELSIF ( TG_OP = 'UPDATE') THEN
-    INSERT INTO "%[2]s" select nextval('%[1]s'), 'UPDATE', clock_timestamp(),  NEW.* ;
+    INSERT INTO %[2]s select nextval('%[1]s'), 'UPDATE', clock_timestamp(),  NEW.* ;
     RETURN NEW;
   ELSIF ( TG_OP = 'DELETE') THEN
-    INSERT INTO "%[2]s" select nextval('%[1]s'), 'DELETE', clock_timestamp(), OLD.* ;
+    INSERT INTO %[2]s select nextval('%[1]s'), 'DELETE', clock_timestamp(), OLD.* ;
     RETURN NEW;
   END IF;
 END;
@@ -722,20 +725,69 @@ func (c *Ctx) replaceViews() error {
 	return nil
 }
 
+// dropAndCleanup drops the trigger first (only when it is there, under
+// lock_timeout, retried), then the audit and shadow tables: dropping the
+// audit table while the trigger still writes into it would fail every write
+// to the table.
 func (c *Ctx) dropAndCleanup(dropPrimary bool) error {
+	Info("Cleaning up", "audit_table", c.auditTable, "shadow_table", c.shadowTable)
+	if err := c.dropAuditTrigger(); err != nil {
+		return err
+	}
 	primaryDrop := ""
 	if dropPrimary {
 		primaryDrop = fmt.Sprintf("DROP TABLE IF EXISTS %s;", c.oldPrimaryTable)
 	}
-	sql := fmt.Sprintf(`DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %s;
-DROP TABLE IF EXISTS %s;
+	sql := fmt.Sprintf(`DROP TABLE IF EXISTS %s;
 DROP TABLE IF EXISTS %s;
 %s
 RESET statement_timeout;
 RESET client_min_messages;
-RESET lock_timeout;`, c.opts.TableName, c.auditTable, c.shadowTable, primaryDrop)
-	_, err := c.db.Run(sql, false)
-	return err
+RESET lock_timeout;`, c.auditTable, c.shadowTable, primaryDrop)
+	if _, err := c.db.Run(sql, false); err != nil {
+		return err
+	}
+	c.flags.SetCleanupSQL("")
+	return nil
+}
+
+func (c *Ctx) auditTriggerExists() (bool, error) {
+	sql := fmt.Sprintf("SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(%s) AND tgname = 'primary_to_audit_table_trigger';",
+		QuoteLiteral(c.qualified(c.opts.TableName)))
+	rows, err := c.db.Run(sql, false)
+	return len(rows) > 0, err
+}
+
+// dropAuditTrigger: DROP TRIGGER takes ACCESS EXCLUSIVE on the table, even
+// with IF EXISTS and no trigger: without a lock_timeout it would wait behind
+// any long query and stall every query on the table queued behind it. So:
+// only when the trigger exists, with lock_timeout, until it succeeds (a
+// second signal exits and logs the SQL to finish by hand).
+func (c *Ctx) dropAuditTrigger() error {
+	for attempt := 1; ; attempt++ {
+		exists, err := c.auditTriggerExists()
+		if err != nil || !exists {
+			return err
+		}
+		sql := fmt.Sprintf("SET LOCAL lock_timeout = '%ds';\nDROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %s;",
+			max(c.opts.WaitTimeForLock, 1), c.opts.TableName)
+		_, err = c.db.Run(sql, false)
+		if err == nil {
+			Info("Audit trigger dropped")
+			return nil
+		}
+		if SQLState(err) != sqlStateLockNotAvailable {
+			return err
+		}
+		Warn(fmt.Sprintf("Couldn't get the lock to drop the audit trigger, attempt %d, retrying (long transactions on the table block it)", attempt))
+	}
+}
+
+// manualCleanupSQL is what dropAndCleanup does, to run by hand.
+func (c *Ctx) manualCleanupSQL() string {
+	s := QuoteIdent(c.opts.Schema)
+	return fmt.Sprintf("SET lock_timeout = '5s'; DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %[1]s.%[2]s; RESET lock_timeout; DROP TABLE IF EXISTS %[1]s.%[3]s; DROP TABLE IF EXISTS %[1]s.%[4]s;",
+		s, c.opts.TableName, c.auditTable, c.shadowTable)
 }
 
 func (c *Ctx) storageParamsReset() string {

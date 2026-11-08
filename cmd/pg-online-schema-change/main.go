@@ -146,12 +146,17 @@ func run() int {
 	return code
 }
 
-// handleSignals: USR1 requests the swap. TERM/INT/QUIT set the terminate flag
-// and cancel the running query on the main connection; the main goroutine
-// then cleans up (trigger, audit and shadow tables) and exits with 128+signal.
+// handleSignals: USR1 requests the swap. TERM/INT/QUIT/HUP set the terminate
+// flag and cancel the running query on the main connection; the main
+// goroutine then cleans up (trigger, audit and shadow tables) and exits with
+// 128+signal. HUP is there because a closed ssh session / terminal / tmux
+// window sends it, and by default it kills the process without any cleanup.
+// SIGPIPE is ignored: with the output piped (| tee, | jq) Ctrl-C kills the
+// reader too, and Go would die on the next log line instead of cleaning up.
 func handleSignals(flags *pgosc.Flags) {
+	signal.Ignore(syscall.SIGPIPE)
 	ch := make(chan os.Signal, 4)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGUSR1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGHUP, syscall.SIGUSR1)
 	go func() {
 		for s := range ch {
 			sig := int(s.(syscall.Signal))
@@ -161,9 +166,15 @@ func handleSignals(flags *pgosc.Flags) {
 				continue
 			}
 			if flags.Terminate.Swap(int32(sig)) != 0 {
-				pgosc.Warn("Second signal received, exiting without cleanup")
+				if sql := flags.CleanupSQL(); sql != "" {
+					pgosc.Warn("Second signal received, exiting without cleanup. Clean up by hand (drop the trigger first, it needs the lock; until then writes go to the audit table)",
+						"cleanup_sql", sql)
+				} else {
+					pgosc.Warn("Second signal received, exiting without cleanup")
+				}
 				os.Exit(128 + sig)
 			}
+			pgosc.Info(fmt.Sprintf("Signal %d received, stopping and cleaning up (a second signal exits without cleanup)", sig))
 			flags.CancelQuery()
 		}
 	}()

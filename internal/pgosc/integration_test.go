@@ -8,6 +8,7 @@ package pgosc
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -656,4 +658,115 @@ func TestVacuumRunsByDefaultAndCanBeSkipped(t *testing.T) {
 				[]string{tc.expected})
 		})
 	}
+}
+
+func TestCleanupWaitsForTheTriggerLockWithoutBlockingWrites(t *testing.T) {
+	d := newTestDB(t, "cleanup_lock")
+	s := d.schema
+	a := args(s, "ALTER TABLE books ADD COLUMN purchased BOOLEAN DEFAULT FALSE;")
+	a.WaitForSwap = true
+	a.WaitTimeForLock = 1
+	flags, done := spawnPerform(t, a)
+	waitForSync(t, d, 3)
+	if !strings.Contains(flags.CleanupSQL(), "DROP TRIGGER IF EXISTS") {
+		t.Fatal(flags.CleanupSQL())
+	}
+
+	// a long transaction on the table: DROP TRIGGER can't get its lock
+	blocker, err := Connect(conn(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	if _, err := blocker.Run(fmt.Sprintf(`SELECT count(*) FROM "%s".books`, s), true); err != nil {
+		t.Fatal(err)
+	}
+	flags.Terminate.Store(15)
+	time.Sleep(2500 * time.Millisecond)
+	if finished(done) {
+		t.Fatal("cleanup must wait for the lock:", <-done)
+	}
+	// the trigger and its audit table are still there, writes keep working
+	// (each wait for the lock is limited to lock_timeout); the writer's
+	// search_path doesn't include the schema: the trigger must not depend on it
+	eq(t, len(d.pgoscTables()), 2)
+	writer, err := Connect(conn(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Run(fmt.Sprintf(`SET lock_timeout = '3s'; INSERT INTO "%s".books(seller_id, username, password, email, "createdOn") VALUES (1, 'during', 'x', 'during@b.c', now())`, s), false); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := blocker.Run("COMMIT", false); err != nil {
+		t.Fatal(err)
+	}
+	var term Terminated
+	if err := wait(t, done); !errors.As(err, &term) || term.Signal != 15 {
+		t.Fatalf("got %v", err)
+	}
+	eq(t, d.pgoscTables(), []string{})
+	eq(t, flags.CleanupSQL(), "")
+	d.exec(fmt.Sprintf(`SET search_path TO "%s"`, s))
+	eq(t, d.values("SELECT 1 FROM pg_trigger WHERE tgrelid = 'books'::regclass AND tgname = 'primary_to_audit_table_trigger'"), []string{})
+	eq(t, d.values("SELECT count(*) FROM books"), []string{"4"})
+}
+
+func startBinary(t *testing.T, d *testDB, stdout *os.File) *exec.Cmd {
+	t.Helper()
+	c := connArgs(d.schema)
+	cmd := exec.Command(buildBinary(t), "perform", "-a", "ALTER TABLE books ADD COLUMN purchased BOOLEAN DEFAULT FALSE",
+		"-d", c.DBName, "-h", c.Host, "-u", c.Username, "-p", strconv.Itoa(int(c.Port)), "-s", d.schema,
+		"--sslmode", "disable", "--wait-for-swap", "--sync-interval", "0.05")
+	cmd.Stdout = stdout
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd
+}
+
+func assertCleanedUp(t *testing.T, d *testDB) {
+	t.Helper()
+	eq(t, d.pgoscTables(), []string{})
+	eq(t, d.values(fmt.Sprintf(`SELECT 1 FROM pg_trigger WHERE tgrelid = '"%s".books'::regclass AND tgname = 'primary_to_audit_table_trigger'`, d.schema)), []string{})
+}
+
+// A closed ssh session / terminal sends HUP: it used to kill the process
+// without cleanup, leaving the trigger on the table.
+func TestBinaryCleansUpOnSighup(t *testing.T) {
+	d := newTestDB(t, "sighup")
+	out, err := os.Create(filepath.Join(t.TempDir(), "out.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := startBinary(t, d, out)
+	waitForSync(t, d, 3)
+	_ = cmd.Process.Signal(syscall.SIGHUP)
+	_ = cmd.Wait()
+	log, _ := os.ReadFile(out.Name())
+	eq(t, cmd.ProcessState.ExitCode(), 129, string(log))
+	if !strings.Contains(string(log), "Audit trigger dropped") {
+		t.Fatal(string(log))
+	}
+	assertCleanedUp(t, d)
+}
+
+// `perform ... | tee log` and Ctrl-C: tee dies too, the next log line hits a
+// broken pipe. Go kills the process on SIGPIPE for stdout by default.
+func TestBinaryCleansUpWhenStdoutIsGone(t *testing.T) {
+	d := newTestDB(t, "sigpipe")
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := startBinary(t, d, w)
+	_ = w.Close()
+	go func() { _, _ = io.Copy(io.Discard, r) }()
+	waitForSync(t, d, 3)
+	_ = r.Close() // the reader is gone
+	_ = cmd.Process.Signal(syscall.SIGINT)
+	_ = cmd.Wait()
+	eq(t, cmd.ProcessState.ExitCode(), 130)
+	assertCleanedUp(t, d)
 }
