@@ -1,0 +1,26 @@
+name: pg-osc-go
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: database
+priority: optional
+maintainer: Evgeny Bezruchkin <evgeny.bezruchkin@flant.com>
+description: |
+  pg-online-schema-change: ALTER TABLE on busy PostgreSQL tables through a
+  shadow table, with a short ACCESS EXCLUSIVE lock for the swap. Supports
+  copying a filtered subset of rows and swapping on demand. Go port, static binary.
+license: MIT
+# same binary name as the Rust package: install one of them
+conflicts:
+  - pg-osc
+contents:
+  # the build script stages the binary of the arch being packaged here
+  - src: dist/stage/pg-online-schema-change
+    dst: /usr/bin/pg-online-schema-change
+    file_info:
+      mode: 0755
+  - src: README.md
+    dst: /usr/share/doc/pg-osc-go/README.md
+    file_info:
+      mode: 0644
