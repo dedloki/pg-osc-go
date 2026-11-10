@@ -831,3 +831,149 @@ func TestTableRewriteDuringBatchedCopyFails(t *testing.T) {
 func TestTableRewriteDuringBatchedCopyRestarts(t *testing.T) {
 	rewriteDuringCopy(t, "rewrite_restart", RewriteRestart)
 }
+
+func ensureRole(d *testDB, role string) {
+	// roles are cluster-wide and the tests run in parallel
+	d.exec(fmt.Sprintf("DO $$ BEGIN CREATE ROLE %s; EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$", role))
+}
+
+// CREATE TABLE ... LIKE ... INCLUDING ALL doesn't copy owner, grants, RLS,
+// policies, replica identity, publications, the table comment and column
+// statistics, and names indexes after the shadow table: the swap carries them
+// over (upstream issues 197 and 20). A foreign key with a mixed case name
+// used to break the swap (upstream issue 196).
+func TestSwapCarriesPropertiesNamesAndQuotedConstraints(t *testing.T) {
+	d := newTestDB(t, "carry")
+	s := d.schema
+	role, owner := "pgosc_test_reader", "pgosc_test_owner"
+	ensureRole(d, role)
+	ensureRole(d, owner)
+	publication := s + "_pub"
+	d.exec(fmt.Sprintf(`SET search_path TO "%[1]s";
+		DROP PUBLICATION IF EXISTS %[4]s;
+		GRANT USAGE ON SCHEMA "%[1]s" TO %[2]s;
+		GRANT SELECT ON books TO %[2]s;
+		GRANT UPDATE (last_login) ON books TO %[2]s;
+		ALTER TABLE books OWNER TO %[3]s;
+		ALTER TABLE books ENABLE ROW LEVEL SECURITY;
+		ALTER TABLE books FORCE ROW LEVEL SECURITY;
+		CREATE POLICY seller_one ON books FOR SELECT TO %[2]s USING (seller_id = 1);
+		ALTER TABLE books REPLICA IDENTITY USING INDEX books_username_key;
+		ALTER TABLE books ALTER COLUMN email SET STATISTICS 300;
+		ALTER TABLE books ALTER COLUMN username SET (n_distinct = 100);
+		COMMENT ON TABLE books IS 'книги';
+		CREATE PUBLICATION %[4]s FOR TABLE books;
+		ALTER TABLE chapters RENAME CONSTRAINT chapters_book_id_fkey TO "FK_Chapters_Book";
+		DROP VIEW books_view;`, s, role, owner, publication))
+	const indexNames = "SELECT string_agg(indexrelid::regclass::text, ',' ORDER BY indexrelid::regclass::text) FROM pg_index WHERE indrelid = 'books'::regclass"
+	before := d.values(indexNames)
+
+	a := args(s, "ALTER TABLE books RENAME COLUMN email TO new_email; ALTER TABLE books ADD COLUMN purchased boolean;")
+	err := Run(mustOptions(t, a), &Flags{})
+	d.exec("DROP PUBLICATION IF EXISTS " + publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.exec(fmt.Sprintf(`SET search_path TO "%s"`, s))
+	eq(t, d.values(indexNames), before, "index names restored")
+	eq(t, d.values("SELECT relowner::regrole, relrowsecurity, relforcerowsecurity, relreplident, obj_description(oid, 'pg_class') FROM pg_class WHERE oid = 'books'::regclass"),
+		[]string{owner + "|t|t|i|книги"})
+	eq(t, d.values("SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'books'::regclass AND indisreplident"), []string{"books_username_key"})
+	eq(t, d.values(fmt.Sprintf("SELECT has_table_privilege('%[1]s', 'books', 'SELECT'), has_table_privilege('%[1]s', 'books', 'INSERT'), has_column_privilege('%[1]s', 'books', 'last_login', 'UPDATE'), has_column_privilege('%[1]s', 'books', 'username', 'UPDATE')", role)),
+		[]string{"t|f|t|f"})
+	eq(t, d.values("SELECT polname, polcmd, pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polrelid = 'books'::regclass"),
+		[]string{"seller_one|r|(seller_id = 1)"})
+	defaultTarget := "-1"
+	if v, _ := strconv.Atoi(d.values("SHOW server_version_num")[0]); v >= 170000 {
+		defaultTarget = "NULL" // PostgreSQL 17 shows the default statistics target as NULL
+	}
+	eq(t, d.values("SELECT attname, attstattarget, array_to_string(attoptions, ',') FROM pg_attribute WHERE attrelid = 'books'::regclass AND attname IN ('new_email', 'username') ORDER BY 1"),
+		[]string{"new_email|300|NULL", "username|" + defaultTarget + "|n_distinct=100"})
+	eq(t, d.values("SELECT conname, convalidated, confrelid::regclass FROM pg_constraint WHERE conrelid = 'chapters'::regclass AND contype = 'f'"),
+		[]string{"FK_Chapters_Book|t|books"})
+	// the old table's indexes got out of the way
+	for _, n := range d.values("SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'pgosc_op_table_books'::regclass") {
+		if !strings.Contains(n, "_pgosc_op_") {
+			t.Fatal("old index not renamed:", n)
+		}
+	}
+}
+
+func TestSwapMovesTheTableInItsPublications(t *testing.T) {
+	d := newTestDB(t, "publication")
+	s := d.schema
+	publication := s + "_pub"
+	d.exec(fmt.Sprintf(`DROP PUBLICATION IF EXISTS %[1]s; CREATE PUBLICATION %[1]s FOR TABLE "%[2]s".books;`, publication, s))
+	err := Run(mustOptions(t, args(s, "ALTER TABLE books ADD COLUMN purchased boolean;")), &Flags{})
+	members := d.values(fmt.Sprintf("SELECT tablename FROM pg_publication_tables WHERE pubname = '%s' ORDER BY 1", publication))
+	d.exec("DROP PUBLICATION IF EXISTS " + publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, members, []string{"books"})
+}
+
+// While the trigger feeds the audit table, ALTER TABLE on the table would
+// break every write to it and TRUNCATE wouldn't reach the new table: both are
+// refused until the swap (upstream issue 15).
+func TestAlterAndTruncateAreRefusedDuringTheRun(t *testing.T) {
+	d := newTestDB(t, "ddl_guard")
+	s := d.schema
+	a := args(s, "ALTER TABLE books ADD COLUMN purchased boolean;")
+	a.WaitForSwap = true
+	_, done := spawnPerform(t, a)
+	waitForSync(t, d, 3)
+
+	other, err := Connect(conn(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	_, err = other.Run(fmt.Sprintf(`ALTER TABLE "%s".books ADD COLUMN extra int`, s), false)
+	errContains(t, err, "ALTER TABLE on it is refused")
+	_, err = other.Run(fmt.Sprintf(`TRUNCATE "%[1]s".chapters, "%[1]s".book_audits, "%[1]s".books`, s), false)
+	errContains(t, err, "TRUNCATE is refused")
+	// other tables are not affected, writes keep working
+	for _, sql := range []string{
+		fmt.Sprintf(`ALTER TABLE "%s".sellers ADD COLUMN extra int`, s),
+		fmt.Sprintf(`INSERT INTO "%s".books(seller_id, username, password, email, "createdOn") VALUES (1, 'g', 'x', 'g@b.c', now())`, s),
+	} {
+		if _, err := other.Run(sql, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := RequestSwap(conn(s), s, "books"); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait(t, done); err != nil {
+		t.Fatal(err)
+	}
+	// gone with the swap
+	for _, sql := range []string{
+		fmt.Sprintf(`ALTER TABLE "%s".books ADD COLUMN extra int`, s),
+		fmt.Sprintf(`TRUNCATE "%s".pgosc_op_table_books CASCADE`, s),
+	} {
+		if _, err := other.Run(sql, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.exec(fmt.Sprintf(`SET search_path TO "%s"`, s))
+	eq(t, d.values("SELECT evtname FROM pg_event_trigger e JOIN pg_proc p ON p.oid = e.evtfoid WHERE p.pronamespace = current_schema::regnamespace"), []string{})
+	eq(t, d.values("SELECT proname FROM pg_proc WHERE pronamespace = current_schema::regnamespace AND proname LIKE 'pgosc_%guard%'"), []string{})
+}
+
+func TestPreflightRefusesLeftoversAndPartitionedTables(t *testing.T) {
+	d := newTestDB(t, "preflight")
+	s := d.schema
+	d.exec(fmt.Sprintf(`SET search_path TO "%s";
+		CREATE TABLE pgosc_op_table_books (id int);
+		CREATE TABLE parted (id int PRIMARY KEY) PARTITION BY RANGE (id);
+		CREATE TABLE parted_1 PARTITION OF parted FOR VALUES FROM (0) TO (100);`, s))
+	errContains(t, Run(mustOptions(t, args(s, "ALTER TABLE books ADD COLUMN purchased boolean;")), &Flags{}), "pgosc_op_table_books already exists")
+	eq(t, d.pgoscTables(), []string{"pgosc_op_table_books"})
+	for _, table := range []string{"parted", "parted_1"} {
+		errContains(t, Run(mustOptions(t, args(s, fmt.Sprintf("ALTER TABLE %s ADD COLUMN x int;", table))), &Flags{}), "Partitioned tables")
+	}
+}

@@ -38,6 +38,10 @@ func setup(opts *Options, flags *Flags) (*Ctx, error) {
 			return nil, err
 		}
 	}
+	if c.serverVersion, err = c.serverVersionNum(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	tn := opts.TableName
 	if c.primaryTableStorageParameters, err = c.storageParametersFor(tn, false); err != nil {
 		db.Close()
@@ -109,11 +113,11 @@ func (c *Ctx) runSteps() error {
 	if pk == nil {
 		return errors.New("Parent table has no primary key, exiting...")
 	}
+	if err := c.preflight(); err != nil {
+		return err
+	}
 	if c.batched() {
-		v, err := c.serverVersionNum()
-		if err != nil {
-			return err
-		}
+		v := c.serverVersion
 		if v < minVersionBatchedCopy {
 			return fmt.Errorf("--copy-batch-pages needs PostgreSQL 14+ (TID range scans), the server is %d", v)
 		}
@@ -136,6 +140,7 @@ func (c *Ctx) runSteps() error {
 		c.runAlterStatement, // same transaction
 		c.copyData,          // same transaction, commits it
 		c.finishCopy,        // dedup after batches, deferred indexes
+		c.checkCarry,        // the swap will be able to carry grants, owner, ...
 		c.runAnalyze,
 		c.replayAndSwap,
 		c.runAnalyze,
@@ -206,8 +211,10 @@ CREATE TRIGGER primary_to_audit_table_trigger
 AFTER INSERT OR UPDATE OR DELETE ON %[3]s
 FOR EACH ROW EXECUTE PROCEDURE primary_to_audit_table_trigger();
 `, seq, audit, table)
-		_, err = c.db.Run(sql, true)
-		return err
+		if _, err = c.db.Run(sql, true); err != nil {
+			return err
+		}
+		return c.setupGuards()
 	}()
 	_, cerr := c.db.Run("COMMIT;", false)
 	return joinErr(err, cerr)
@@ -687,12 +694,28 @@ func (c *Ctx) swap() error {
 		if _, err := c.db.Run(fmt.Sprintf("SET statement_timeout to '%s';", swapStatementTimeout), true); err != nil {
 			return err
 		}
+		// ALTER TABLE on the table is ours from here on (rolled back with the swap)
+		dropGuard, err := c.dropDDLGuardSQL(true)
+		if err != nil {
+			return err
+		}
+		if _, err := c.db.Run(dropGuard, true); err != nil {
+			return err
+		}
 		rows, err := c.rowsToPlay(true)
 		if err != nil {
 			return err
 		}
 		if err := c.play(rows, true); err != nil {
 			return err
+		}
+		// before the renames, while the source is still TableName
+		cr, err := c.captureCarry()
+		if err != nil {
+			return err
+		}
+		for _, w := range cr.warnings {
+			Warn(w)
 		}
 		primaryKey, err := c.requirePrimaryKey()
 		if err != nil {
@@ -712,9 +735,17 @@ ALTER TABLE %s RENAME to %s;
 %s
 DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %s;
 DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %s;
+DROP TRIGGER IF EXISTS %s ON %s;
+%s
+%s
+%s
 `, pkRefresh, t, c.oldPrimaryTable, c.shadowTable, t,
 			c.referentialForeignKeyStatements, c.selfForeignKeyStatements, c.triggerStatements,
-			c.storageParamsReset(), t, c.oldPrimaryTable)
+			c.storageParamsReset(), t, c.oldPrimaryTable,
+			c.truncateGuardName(), c.oldPrimaryTable,
+			strings.Join(cr.oldTableStatements, "\n"),
+			strings.Join(cr.nameStatements, "\n"),
+			joinStatements(cr.statements))
 		_, err = c.db.Run(sql, true)
 		return err
 	}()
@@ -770,6 +801,19 @@ func (c *Ctx) replaceViews() error {
 // audit table while the trigger still writes into it would fail every write
 // to the table.
 func (c *Ctx) dropAndCleanup(dropPrimary bool) error {
+	// the cancel request sent on a stop signal is asynchronous: it can land on
+	// one of the cleanup statements instead of the query it was meant for.
+	// Every step is idempotent, so just go again.
+	for attempt := 1; ; attempt++ {
+		err := c.dropAndCleanupOnce(dropPrimary)
+		if err == nil || SQLState(err) != sqlStateQueryCanceled || attempt == 3 {
+			return err
+		}
+		Warn("Cleanup statement canceled (late cancel request of the stop signal), retrying")
+	}
+}
+
+func (c *Ctx) dropAndCleanupOnce(dropPrimary bool) error {
 	Info("Cleaning up", "audit_table", c.auditTable, "shadow_table", c.shadowTable)
 	if err := c.dropAuditTrigger(); err != nil {
 		return err
@@ -778,12 +822,19 @@ func (c *Ctx) dropAndCleanup(dropPrimary bool) error {
 	if dropPrimary {
 		primaryDrop = fmt.Sprintf("DROP TABLE IF EXISTS %s;", c.oldPrimaryTable)
 	}
-	sql := fmt.Sprintf(`DROP TABLE IF EXISTS %s;
+	dropGuard, err := c.dropDDLGuardSQL(false)
+	if err != nil {
+		return err
+	}
+	sql := fmt.Sprintf(`%s
+DROP FUNCTION IF EXISTS %s();
+DROP FUNCTION IF EXISTS %s();
+DROP TABLE IF EXISTS %s;
 DROP TABLE IF EXISTS %s;
 %s
 RESET statement_timeout;
 RESET client_min_messages;
-RESET lock_timeout;`, c.auditTable, c.shadowTable, primaryDrop)
+RESET lock_timeout;`, dropGuard, c.ddlGuardName(), c.truncateGuardName(), c.auditTable, c.shadowTable, primaryDrop)
 	if _, err := c.db.Run(sql, false); err != nil {
 		return err
 	}
@@ -792,8 +843,8 @@ RESET lock_timeout;`, c.auditTable, c.shadowTable, primaryDrop)
 }
 
 func (c *Ctx) auditTriggerExists() (bool, error) {
-	sql := fmt.Sprintf("SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(%s) AND tgname = 'primary_to_audit_table_trigger';",
-		QuoteLiteral(c.qualified(c.opts.TableName)))
+	sql := fmt.Sprintf("SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass(%s) AND tgname IN ('primary_to_audit_table_trigger', %s);",
+		QuoteLiteral(c.qualified(c.opts.TableName)), QuoteLiteral(c.truncateGuardName()))
 	rows, err := c.db.Run(sql, false)
 	return len(rows) > 0, err
 }
@@ -809,8 +860,8 @@ func (c *Ctx) dropAuditTrigger() error {
 		if err != nil || !exists {
 			return err
 		}
-		sql := fmt.Sprintf("SET LOCAL lock_timeout = '%ds';\nDROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %s;",
-			max(c.opts.WaitTimeForLock, 1), c.opts.TableName)
+		sql := fmt.Sprintf("SET LOCAL lock_timeout = '%[1]ds';\nDROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %[2]s;\nDROP TRIGGER IF EXISTS %[3]s ON %[2]s;",
+			max(c.opts.WaitTimeForLock, 1), c.opts.TableName, c.truncateGuardName())
 		_, err = c.db.Run(sql, false)
 		if err == nil {
 			Info("Audit trigger dropped")
@@ -826,8 +877,75 @@ func (c *Ctx) dropAuditTrigger() error {
 // manualCleanupSQL is what dropAndCleanup does, to run by hand.
 func (c *Ctx) manualCleanupSQL() string {
 	s := QuoteIdent(c.opts.Schema)
-	return fmt.Sprintf("SET lock_timeout = '5s'; DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %[1]s.%[2]s; RESET lock_timeout; DROP TABLE IF EXISTS %[1]s.%[3]s; DROP TABLE IF EXISTS %[1]s.%[4]s;",
-		s, c.opts.TableName, c.auditTable, c.shadowTable)
+	return fmt.Sprintf("SET lock_timeout = '5s'; DROP TRIGGER IF EXISTS primary_to_audit_table_trigger ON %[1]s.%[2]s; DROP TRIGGER IF EXISTS %[5]s ON %[1]s.%[2]s; RESET lock_timeout; DROP EVENT TRIGGER IF EXISTS %[6]s; DROP FUNCTION IF EXISTS %[1]s.%[6]s(); DROP FUNCTION IF EXISTS %[1]s.%[5]s(); DROP TABLE IF EXISTS %[1]s.%[3]s; DROP TABLE IF EXISTS %[1]s.%[4]s;",
+		s, c.opts.TableName, c.auditTable, c.shadowTable, c.truncateGuardName(), c.ddlGuardName())
+}
+
+func joinStatements(list []string) string {
+	var b strings.Builder
+	for _, s := range list {
+		b.WriteString(s)
+		b.WriteString(";\n")
+	}
+	return b.String()
+}
+
+func (c *Ctx) ddlGuardName() string      { return "pgosc_ddl_guard_" + c.id }
+func (c *Ctx) truncateGuardName() string { return "pgosc_truncate_guard_" + c.id }
+
+// dropDDLGuardSQL: DROP EVENT TRIGGER needs a superuser even with IF EXISTS,
+// so only when it is there.
+func (c *Ctx) dropDDLGuardSQL(reuse bool) (string, error) {
+	v, err := c.db.FirstValue(fmt.Sprintf("SELECT 1 FROM pg_event_trigger WHERE evtname = %s;", QuoteLiteral(c.ddlGuardName())), reuse)
+	if err != nil || v == nil {
+		return "", err
+	}
+	return fmt.Sprintf("DROP EVENT TRIGGER %s;", c.ddlGuardName()), nil
+}
+
+// setupGuards: while the trigger feeds the audit table, a change of the
+// table's columns would make every write to it fail (the audit table has the
+// old columns) and TRUNCATE isn't captured at all. TRUNCATE is refused by a
+// statement trigger; ALTER TABLE by an event trigger, which only a superuser
+// can create (otherwise a warning). Both go away with the swap or the
+// cleanup. Runs in the transaction that adds the audit trigger.
+func (c *Ctx) setupGuards() error {
+	schema := QuoteIdent(c.opts.Schema)
+	table := c.opts.TableName
+	tg := c.truncateGuardName()
+	sql := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %[1]s.%[2]s() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'pg-osc is rebuilding table %%.%%: TRUNCATE is refused until it finishes (the change would not reach the new table)', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+END $$;
+CREATE TRIGGER %[2]s BEFORE TRUNCATE ON %[3]s FOR EACH STATEMENT EXECUTE PROCEDURE %[1]s.%[2]s();`, schema, tg, table)
+	if _, err := c.db.Run(sql, true); err != nil {
+		return err
+	}
+	super, err := c.db.FirstValue("SELECT rolsuper FROM pg_roles WHERE rolname = current_user;", true)
+	if err != nil {
+		return err
+	}
+	if super == nil || *super != "t" {
+		Warn(fmt.Sprintf("Not a superuser: can't install the event trigger that refuses ALTER TABLE on %s during the run. Don't change the table's columns until the swap: every write to it would fail", table))
+		return nil
+	}
+	oid, err := c.db.FirstValue(fmt.Sprintf("SELECT %s::regclass::oid;", QuoteLiteral(c.qualified(table))), true)
+	if err != nil {
+		return err
+	}
+	if oid == nil {
+		return fmt.Errorf("table %s not found", table)
+	}
+	eg := c.ddlGuardName()
+	sql = fmt.Sprintf(`CREATE OR REPLACE FUNCTION %[1]s.%[2]s() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_event_trigger_ddl_commands() WHERE classid = 'pg_class'::regclass AND objid = %[3]s) THEN
+    RAISE EXCEPTION 'pg-osc is rebuilding table %%: ALTER TABLE on it is refused until it finishes (every write would fail). To force it: DROP EVENT TRIGGER %[2]s', %[4]s;
+  END IF;
+END $$;
+CREATE EVENT TRIGGER %[2]s ON ddl_command_end WHEN TAG IN ('ALTER TABLE') EXECUTE PROCEDURE %[1]s.%[2]s();`, schema, eg, *oid, QuoteLiteral(c.qualified(table)))
+	_, err = c.db.Run(sql, true)
+	return err
 }
 
 func (c *Ctx) storageParamsReset() string {

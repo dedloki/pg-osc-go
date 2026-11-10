@@ -14,6 +14,7 @@ const lockAttempt = 4
 const (
 	sqlStateLockNotAvailable       = "55P03"
 	sqlStateInFailedSQLTransaction = "25P02"
+	sqlStateQueryCanceled          = "57014"
 )
 
 var errNoPrimaryKey = errors.New("no primary key")
@@ -214,9 +215,9 @@ func (k Constraint) from(table string) bool { return k.TableFrom != nil && *k.Ta
 
 func addConstraintStatement(k Constraint) string {
 	if strings.HasSuffix(k.Definition, "NOT VALID") {
-		return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s %s;", k.TableOn, k.ConstraintName, k.Definition)
+		return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s %s;", k.TableOn, QuoteIdent(k.ConstraintName), k.Definition)
 	}
-	return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s %s NOT VALID;", k.TableOn, k.ConstraintName, k.Definition)
+	return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s %s NOT VALID;", k.TableOn, QuoteIdent(k.ConstraintName), k.Definition)
 }
 
 func (c *Ctx) referentialForeignKeysToRefresh(table string) (string, error) {
@@ -227,7 +228,7 @@ func (c *Ctx) referentialForeignKeysToRefresh(table string) (string, error) {
 	var b strings.Builder
 	for _, k := range all {
 		if k.from(table) && k.ConstraintType == "f" {
-			fmt.Fprintf(&b, "ALTER TABLE %s DROP CONSTRAINT %s; %s", k.TableOn, k.ConstraintName, addConstraintStatement(k))
+			fmt.Fprintf(&b, "ALTER TABLE %s DROP CONSTRAINT %s; %s", k.TableOn, QuoteIdent(k.ConstraintName), addConstraintStatement(k))
 		}
 	}
 	return b.String(), nil
@@ -255,12 +256,12 @@ func (c *Ctx) getForeignKeysToValidate(table string) ([]string, error) {
 	var out []string
 	for _, k := range all {
 		if k.from(table) && k.ConstraintType == "f" {
-			out = append(out, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", k.TableOn, k.ConstraintName))
+			out = append(out, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", k.TableOn, QuoteIdent(k.ConstraintName)))
 		}
 	}
 	for _, k := range all {
 		if k.TableOn == table && k.ConstraintType == "f" {
-			out = append(out, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", k.TableOn, k.ConstraintName))
+			out = append(out, fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s;", k.TableOn, QuoteIdent(k.ConstraintName)))
 		}
 	}
 	return out, nil

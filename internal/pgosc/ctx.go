@@ -66,6 +66,10 @@ func (t Terminated) Error() string { return fmt.Sprintf("terminated by signal %d
 var ErrLockNotAcquired = errors.New("Couldn't acquire ACCESS EXCLUSIVE lock")
 
 type Ctx struct {
+	// random id of this run, part of every name it creates
+	id            string
+	serverVersion int64
+
 	opts  *Options
 	db    *DB
 	flags *Flags
@@ -95,6 +99,7 @@ type Ctx struct {
 func newCtx(opts *Options, db *DB, flags *Flags, id string) *Ctx {
 	t := strings.ToLower(opts.Table)
 	return &Ctx{
+		id:                  id,
 		opts:                opts,
 		db:                  db,
 		flags:               flags,
