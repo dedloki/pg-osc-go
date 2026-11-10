@@ -88,6 +88,17 @@ func (c *Ctx) relationPages(table string) (uint64, error) {
 	return uint64(parseInt(v)), err
 }
 
+// relationFilenode changes on every rewrite of the table (VACUUM FULL,
+// CLUSTER, TRUNCATE, rewriting ALTER TABLE, pg_repack, pg_squeeze), so ctids
+// may have moved. reuse = inside the open transaction.
+func (c *Ctx) relationFilenode(table string, reuse bool) (string, error) {
+	v, err := c.db.FirstValue(fmt.Sprintf("SELECT pg_relation_filenode(%s::regclass);", QuoteLiteral(c.qualified(table))), reuse)
+	if err != nil || v == nil {
+		return "", err
+	}
+	return *v, nil
+}
+
 // shadowIndexes: indexes of the shadow table, primary key first.
 func (c *Ctx) shadowIndexes(reuse bool) ([]ShadowIndex, error) {
 	sql := fmt.Sprintf(`SELECT i.indexrelid::regclass::text AS name, pg_get_indexdef(i.indexrelid) AS indexdef,

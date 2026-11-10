@@ -316,6 +316,11 @@ func (c *Ctx) copyData() error {
 func (c *Ctx) copyDataBatched() error {
 	pagesPerBatch := c.opts.CopyBatchPages
 	table := c.opts.TableName
+	// before the page count: a rewrite in between is caught by the first batch
+	filenode, err := c.relationFilenode(table, false)
+	if err != nil {
+		return err
+	}
 	totalPages, err := c.relationPages(table)
 	if err != nil {
 		return err
@@ -342,6 +347,7 @@ func (c *Ctx) copyDataBatched() error {
 	lastLog := time.Now()
 	var copied int64
 	var start uint64
+	restarts := 0
 	for {
 		if err := c.checkTerminate(); err != nil {
 			return err
@@ -356,8 +362,42 @@ func (c *Ctx) copyDataBatched() error {
 		}
 		sql := fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM ONLY %s WHERE %s%s%s;",
 			c.shadowTable, strings.Join(insert, ", "), strings.Join(sel, ", "), table, rng, filter, onConflict)
-		n, err := c.db.Execute(sql, false)
+		// the INSERT locks the table till the end of the batch, a rewrite
+		// can't happen after it: check in the same transaction
+		n, err := c.db.Execute(sql, true)
 		if err != nil {
+			return err
+		}
+		now, err := c.relationFilenode(table, true)
+		if err != nil {
+			_, _ = c.db.Run("ROLLBACK;", false)
+			return err
+		}
+		if now != filenode {
+			if _, err := c.db.Run("ROLLBACK;", false); err != nil {
+				return err
+			}
+			msg := fmt.Sprintf("The table was rewritten during the batched copy (VACUUM FULL, CLUSTER, pg_repack, pg_squeeze, TRUNCATE or a rewriting ALTER TABLE): row addresses changed, the pages copied so far don't line up with the rest. Relfilenode %s -> %s", filenode, now)
+			if c.opts.OnTableRewrite != RewriteRestart {
+				return errors.New(msg + ". Don't run those on the table during the copy, or use --on-table-rewrite restart")
+			}
+			Warn(msg + ". Restarting the copy from the first page (--on-table-rewrite restart)")
+			// the audit table is kept: it has every change since the trigger
+			if _, err := c.db.Run(fmt.Sprintf("TRUNCATE %s;", c.shadowTable), false); err != nil {
+				return err
+			}
+			if filenode, err = c.relationFilenode(table, false); err != nil {
+				return err
+			}
+			if totalPages, err = c.relationPages(table); err != nil {
+				return err
+			}
+			copied, start = 0, 0
+			restarts++
+			Info("Copying contents in batches again..", "pages", totalPages, "restarts", restarts)
+			continue
+		}
+		if _, err := c.db.Run("COMMIT;", false); err != nil {
 			return err
 		}
 		copied += n

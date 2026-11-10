@@ -17,6 +17,16 @@ const (
 	SyncInterval   = 1.0
 )
 
+// RewriteAction is what to do when the table is rewritten during a batched copy.
+type RewriteAction string
+
+const (
+	// RewriteFail stops with an error and cleans up
+	RewriteFail RewriteAction = "fail"
+	// RewriteRestart empties the shadow table and copies again from the first page
+	RewriteRestart RewriteAction = "restart"
+)
+
 type ConnArgs struct {
 	Schema   string
 	DBName   string
@@ -56,6 +66,7 @@ type PerformArgs struct {
 	DeferIndexes             bool
 	MaintenanceWorkMem       string
 	SkipVacuum               bool
+	OnTableRewrite           RewriteAction // "" = fail
 }
 
 // Options are the validated options for `perform`.
@@ -77,6 +88,7 @@ type Options struct {
 	DeferIndexes             bool
 	MaintenanceWorkMem       string
 	SkipVacuum               bool
+	OnTableRewrite           RewriteAction
 	// Table as Postgres sees it (unquoted)
 	Table string
 	// TableName as it goes into SQL (quoted if needed)
@@ -127,6 +139,15 @@ func OptionsFromArgs(a PerformArgs) (*Options, error) {
 		return nil, errors.New("--copy-batch-pages and --copy-statement can't be used together")
 	}
 
+	onRewrite := a.OnTableRewrite
+	switch onRewrite {
+	case "":
+		onRewrite = RewriteFail
+	case RewriteFail, RewriteRestart:
+	default:
+		return nil, fmt.Errorf("--on-table-rewrite should be fail or restart, got %s", onRewrite)
+	}
+
 	table, err := Table(alter)
 	if err != nil {
 		return nil, err
@@ -149,6 +170,7 @@ func OptionsFromArgs(a PerformArgs) (*Options, error) {
 		DeferIndexes:             a.DeferIndexes,
 		MaintenanceWorkMem:       strings.TrimSpace(a.MaintenanceWorkMem),
 		SkipVacuum:               a.SkipVacuum,
+		OnTableRewrite:           onRewrite,
 		Table:                    table,
 		TableName:                TableName(alter, table),
 	}, nil

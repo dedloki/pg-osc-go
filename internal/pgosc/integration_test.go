@@ -250,6 +250,10 @@ func TestOptionsValidation(t *testing.T) {
 	a.CopyStatement = "sql.go"
 	errContains(t, ok(a), "can't be used together")
 
+	a = args("s", "ALTER TABLE books ADD COLUMN a int")
+	a.OnTableRewrite = "ignore"
+	errContains(t, ok(a), "--on-table-rewrite should be fail or restart")
+
 	a = args("s", `ALTER TABLE "Books" ADD COLUMN a int`)
 	a.Filter = "  where x IS NOT NULL "
 	o := mustOptions(t, a)
@@ -769,4 +773,61 @@ func TestBinaryCleansUpWhenStdoutIsGone(t *testing.T) {
 	_ = cmd.Wait()
 	eq(t, cmd.ProcessState.ExitCode(), 130)
 	assertCleanedUp(t, d)
+}
+
+// rewriteDuringCopy: VACUUM FULL in the middle of a batched copy moves every
+// row to a new ctid. fail stops with an error, restart copies again and ends
+// up correct.
+func rewriteDuringCopy(t *testing.T, name string, action RewriteAction) {
+	d := newTestDB(t, name)
+	s := d.schema
+	// the filter calls a slow function so the copy takes a few seconds
+	d.exec(fmt.Sprintf(`SET search_path TO "%s";
+		CREATE TABLE barcode (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), stock_id int, barcode text NOT NULL UNIQUE);
+		INSERT INTO barcode (stock_id, barcode)
+		  SELECT CASE WHEN g %% 4 = 0 THEN NULL ELSE g END, 'bc' || g FROM generate_series(1, 20000) g;
+		DELETE FROM barcode WHERE stock_id %% 3 = 0; -- holes, so VACUUM FULL really moves rows
+		CREATE FUNCTION slow(v int) RETURNS boolean LANGUAGE plpgsql AS $$
+		BEGIN IF v %% 50 = 0 THEN PERFORM pg_sleep(0.01); END IF; RETURN true; END $$;`, s))
+	a := args(s, "ALTER TABLE barcode ALTER COLUMN stock_id SET NOT NULL;")
+	a.Filter = "stock_id IS NOT NULL AND slow(stock_id)"
+	a.CopyBatchPages = 1
+	a.WaitForSwap = true
+	a.OnTableRewrite = action
+	_, done := spawnPerform(t, a)
+
+	waitUntil(t, "copy in progress", func() bool {
+		shadow := d.find("pgosc_st_")
+		return shadow != "" && d.values(fmt.Sprintf(`SELECT count(*) > 0 FROM "%s".%s`, s, shadow))[0] == "t"
+	})
+	if err := d.db.ExecRaw(fmt.Sprintf(`VACUUM FULL "%s".barcode`, s)); err != nil {
+		t.Fatal(err)
+	}
+	d.exec(fmt.Sprintf(`UPDATE "%s".barcode SET barcode = barcode || '-x' WHERE stock_id %% 7 = 0`, s))
+
+	if action == RewriteFail {
+		errContains(t, wait(t, done), "rewritten during the batched copy")
+		eq(t, d.pgoscTables(), []string{})
+		return
+	}
+	waitForSync(t, d, 1)
+	if err := RequestSwap(conn(s), s, "barcode"); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait(t, done); err != nil {
+		t.Fatal(err)
+	}
+	d.exec(fmt.Sprintf(`SET search_path TO "%s"`, s))
+	old := "pgosc_op_table_barcode WHERE stock_id IS NOT NULL"
+	eq(t, d.values(fmt.Sprintf(`SELECT (SELECT count(*) FROM (SELECT * FROM barcode EXCEPT SELECT * FROM %[1]s) d),
+		(SELECT count(*) FROM (SELECT * FROM %[1]s EXCEPT SELECT * FROM barcode) d),
+		(SELECT count(*) FROM barcode) = (SELECT count(*) FROM %[1]s)`, old)), []string{"0|0|t"})
+}
+
+func TestTableRewriteDuringBatchedCopyFails(t *testing.T) {
+	rewriteDuringCopy(t, "rewrite_fail", RewriteFail)
+}
+
+func TestTableRewriteDuringBatchedCopyRestarts(t *testing.T) {
+	rewriteDuringCopy(t, "rewrite_restart", RewriteRestart)
 }

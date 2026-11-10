@@ -105,6 +105,7 @@ func run() int {
 	f.BoolVar(&perform.DeferIndexes, "defer-indexes", false, "Build the shadow table's indexes, primary key and unique constraints after the copy instead of maintaining them row by row during it. Much faster for big tables.")
 	f.StringVar(&perform.MaintenanceWorkMem, "maintenance-work-mem", "", "maintenance_work_mem for building the deferred indexes, e.g. 4GB")
 	f.BoolVar(&perform.SkipVacuum, "skip-vacuum", false, "Don't VACUUM the table before starting (the copy doesn't need it; on a big table it can take long)")
+	f.StringVar((*string)(&perform.OnTableRewrite), "on-table-rewrite", string(pgosc.RewriteFail), "With --copy-batch-pages: fail or restart, what to do if the table is rewritten during the copy (VACUUM FULL, CLUSTER, pg_repack, pg_squeeze, rewriting ALTER TABLE move every row to a new ctid; so does TRUNCATE, which the audit doesn't capture in any mode, restart doesn't make it right). Checked in every batch.")
 	required(performCmd, "alter-statement", "dbname", "host", "username")
 	performCmd.PreRunE = func(cmd *cobra.Command, _ []string) error {
 		if cmd.Flags().Changed("copy-batch-pages") && perform.CopyBatchPages == 0 {
