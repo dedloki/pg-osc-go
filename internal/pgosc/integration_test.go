@@ -437,19 +437,53 @@ func TestTerminateCleansUpAndKeepsTheTable(t *testing.T) {
 	eq(t, d.values("SELECT 1 FROM pg_trigger WHERE tgrelid = 'books'::regclass AND tgname = 'primary_to_audit_table_trigger'"), []string{})
 }
 
-func TestFailureAfterSwapNeverDropsTheOldTable(t *testing.T) {
+func TestUnvalidatedForeignKeyAfterSwapIsReportedAndKeepsTheOldTable(t *testing.T) {
 	d := newTestDB(t, "keep_old")
 	s := d.schema
 	d.exec(fmt.Sprintf(`SET search_path TO "%s"; UPDATE books SET last_login = NULL WHERE user_id = 1`, s))
 
-	// chapters references book 1, which is filtered out -> VALIDATE CONSTRAINT fails after the swap
+	// chapters references book 1, which is filtered out -> VALIDATE CONSTRAINT
+	// fails after the swap: reported, the rest goes on (views), the old table
+	// is kept despite --drop
 	a := args(s, "ALTER TABLE books ALTER COLUMN last_login SET NOT NULL;")
 	a.Filter = "last_login IS NOT NULL"
 	a.Drop = true
-	errContains(t, Run(mustOptions(t, a), &Flags{}), "violates foreign key")
+	if err := Run(mustOptions(t, a), &Flags{}); err != nil {
+		t.Fatal(err)
+	}
 
+	d.exec(fmt.Sprintf(`SET search_path TO "%s"`, s))
 	eq(t, d.pgoscTables(), []string{"pgosc_op_table_books"})
 	eq(t, d.values("SELECT count(*) FROM pgosc_op_table_books"), []string{"3"})
+	eq(t, d.values("SELECT conrelid::regclass, convalidated FROM pg_constraint WHERE contype = 'f' AND confrelid = 'books'::regclass ORDER BY 1"),
+		[]string{"book_audits|t", "chapters|f"})
+	// the view was still moved to the new table
+	eq(t, d.values("SELECT count(*) FROM books_view"), []string{"2"})
+	eq(t, d.values("SELECT 1 FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid WHERE d.refobjid = 'pgosc_op_table_books'::regclass"), []string{})
+}
+
+// The table's own foreign keys move to the new table; the old one loses them,
+// otherwise it stays a child of the referenced tables and every ON DELETE
+// CASCADE goes through it too.
+func TestOldTableLosesItsForeignKeys(t *testing.T) {
+	d := newTestDB(t, "old_fk")
+	s := d.schema
+	d.exec(fmt.Sprintf(`SET search_path TO "%s";
+		ALTER TABLE books DROP CONSTRAINT books_seller_id_fkey;
+		ALTER TABLE books ADD CONSTRAINT "Books_Seller" FOREIGN KEY (seller_id) REFERENCES sellers ON DELETE CASCADE;
+		INSERT INTO sellers(name, "createdOn") VALUES ('other shop', now());
+		INSERT INTO books(seller_id, username, password, email, "createdOn") VALUES (2, 'other', 'x', 'o@b.c', now());`, s))
+	if err := Run(mustOptions(t, args(s, "ALTER TABLE books ADD COLUMN purchased boolean;")), &Flags{}); err != nil {
+		t.Fatal(err)
+	}
+	d.exec(fmt.Sprintf(`SET search_path TO "%s"`, s))
+	eq(t, d.values("SELECT conname, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'books'::regclass AND contype = 'f'"),
+		[]string{"Books_Seller|t|FOREIGN KEY (seller_id) REFERENCES sellers(id) ON DELETE CASCADE"})
+	eq(t, d.values("SELECT conname FROM pg_constraint WHERE conrelid = 'pgosc_op_table_books'::regclass AND contype = 'f'"), []string{})
+	// the cascade reaches the new table only
+	d.exec("DELETE FROM sellers WHERE id = 2")
+	eq(t, d.values("SELECT (SELECT count(*) FROM books WHERE seller_id = 2), (SELECT count(*) FROM pgosc_op_table_books WHERE seller_id = 2)"),
+		[]string{"0|1"})
 }
 
 func TestCopyStatementIsUsed(t *testing.T) {

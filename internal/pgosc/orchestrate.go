@@ -144,14 +144,31 @@ func (c *Ctx) runSteps() error {
 		c.runAnalyze,
 		c.replayAndSwap,
 		c.runAnalyze,
-		c.validateConstraints,
-		c.replaceViews,
-		func() error { return c.dropAndCleanup(c.opts.Drop) },
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
 			return err
 		}
+	}
+	// the swap is done: a foreign key that doesn't validate (rows pointing
+	// nowhere) is reported, it doesn't stop the rest
+	notValidated, err := c.validateConstraints()
+	if err != nil {
+		return err
+	}
+	if err := c.replaceViews(); err != nil {
+		return err
+	}
+	drop := c.opts.Drop && len(notValidated) == 0
+	if c.opts.Drop && !drop {
+		Warn(fmt.Sprintf("Not dropping %s (--drop): some foreign keys didn't validate, it may be needed to sort out the rows", c.oldPrimaryTable))
+	}
+	if err := c.dropAndCleanup(drop); err != nil {
+		return err
+	}
+	if len(notValidated) > 0 {
+		Warn("Swap done, but some foreign keys stay NOT VALID: fix the rows they point from and run the statements by hand",
+			"validate_sql", notValidated)
 	}
 	return nil
 }
@@ -764,21 +781,32 @@ func (c *Ctx) runVacuum() error {
 	return c.db.ExecRaw(fmt.Sprintf("VACUUM VERBOSE %s.%s;", QuoteIdent(c.opts.Schema), c.opts.TableName))
 }
 
-func (c *Ctx) validateConstraints() error {
+// validateConstraints validates the foreign keys re-created NOT VALID by the
+// swap. Returns the statements that failed (a violation is logged and
+// skipped, the constraint stays NOT VALID and still checks new writes).
+func (c *Ctx) validateConstraints() ([]string, error) {
 	if c.opts.SkipForeignKeyValidation {
-		return nil
+		return nil, nil
 	}
 	statements, err := c.getForeignKeysToValidate(c.opts.TableName)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var failed []string
 	for _, s := range statements {
+		if err := c.checkTerminate(); err != nil {
+			return nil, err
+		}
 		Info("Validating constraints!", "statement", s)
 		if _, err := c.db.Run(s, false); err != nil {
-			return err
+			if _, terminating := c.flags.Terminating(); terminating || !IsPgError(err) {
+				return nil, err
+			}
+			Error("Constraint not validated, it stays NOT VALID: "+err.Error(), "statement", s)
+			failed = append(failed, s)
 		}
 	}
-	return nil
+	return failed, nil
 }
 
 func (c *Ctx) replaceViews() error {

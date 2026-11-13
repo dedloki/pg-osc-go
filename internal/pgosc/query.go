@@ -234,15 +234,21 @@ func (c *Ctx) referentialForeignKeysToRefresh(table string) (string, error) {
 	return b.String(), nil
 }
 
+// selfForeignKeysToRefresh runs in the swap after the renames: the table's
+// own foreign keys move to the new table. The old table loses them, otherwise
+// it stays a child of the referenced tables (every ON DELETE CASCADE would
+// also go through the frozen old table, and a delete there needs its locks).
 func (c *Ctx) selfForeignKeysToRefresh(table string) (string, error) {
 	all, err := c.getAllConstraints()
 	if err != nil {
 		return "", err
 	}
+	old := c.qualified(c.oldPrimaryTable)
 	var b strings.Builder
 	for _, k := range all {
 		if k.TableOn == table && k.ConstraintType == "f" {
 			b.WriteString(addConstraintStatement(k))
+			fmt.Fprintf(&b, " ALTER TABLE %s DROP CONSTRAINT %s;", old, QuoteIdent(k.ConstraintName))
 		}
 	}
 	return b.String(), nil
